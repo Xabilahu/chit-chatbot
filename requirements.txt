@@ -1,0 +1,5 @@
+ChatterBot
+chatterbot-corpus
+pre-commit==2.0.1
+spacy
+toml
