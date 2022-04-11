@@ -8,6 +8,7 @@ from enum import Enum
 from typing import List, Tuple
 
 import urllib3
+import yake
 from nltk.tokenize import wordpunct_tokenize
 from tqdm import tqdm
 
@@ -33,10 +34,13 @@ class DataWrapper(metaclass=ABCMeta):
             self.name,
         )
 
-    def preprocess(self, text: str):
+    def sanitize_yaml(self, text):
         # Unify quote characters into ' so that we can later quote the whole text with "
         # (avoid conflicts with YAML indicator symbols : and -)
-        return wordpunct_tokenize(text.translate(text.maketrans('"', "'")))
+        return text.translate(text.maketrans('"/\\', "'  "))
+
+    def preprocess(self, text: str):
+        return wordpunct_tokenize(self.sanitize_yaml(text))
 
     @abstractmethod
     def prepare_data(self):
@@ -99,7 +103,46 @@ class PersonaChat(DataWrapper):
         )
 
     def prepare_data(self):
-        pass  # TODO
+        filename = os.path.join(self.data_path, "personachat_self_original.json")
+        self._download_data(filename)
+
+        keyword_extractor = yake.KeywordExtractor(lan="en", n=1, windowsSize=3, top=1)
+        with open(filename, "r") as f:
+            contents = json.load(f)
+
+        with open(os.path.join(self.data_path, "split_mapping.csv"), "w") as csvfile:
+            csvfile.write("split,filename\n")
+            for split, key_name in [(Split.train, "train"), (Split.test, "valid")]:
+                for idx, dialog in enumerate(contents["train"], start=1):
+                    c_filename = os.path.join(
+                        self.data_path, f"{split.value}-{idx}.yml"
+                    )
+                    self.filenames.append(
+                        (split, os.path.splitext(os.path.basename(c_filename))[0])
+                    )
+                    csvfile.write(
+                        f"{split.value},{os.path.splitext(os.path.basename(c_filename))[0]}\n"
+                    )
+                    with open(c_filename, "w") as outfile:
+                        keywords = set()
+                        for p in dialog["personality"]:
+                            keyword_candidates = keyword_extractor.extract_keywords(p)
+                            if len(keyword_candidates) > 0:
+                                keywords.add(keyword_candidates[0][0])
+                        outfile.write("categories:\n")
+                        for kw in keywords:
+                            outfile.write(f"- {kw}\n")
+                        outfile.write("conversations:\n")
+                        first = True
+                        for utterance in dialog["utterances"][-1]["history"]:
+                            sentence = " ".join(self.preprocess(utterance))
+                            if first:
+                                outfile.write(f'- - "{sentence}"\n')
+                                first = False
+                            else:
+                                outfile.write(f'  - "{sentence}"\n')
+        del contents
+        os.remove(filename)
 
 
 class WizardOfWikipedia(DataWrapper):
@@ -124,7 +167,7 @@ class WizardOfWikipedia(DataWrapper):
             contents = json.load(f)
             for split in Split:
                 for topic_name in contents[split.value]:
-                    topic_splits[topic_name] = split
+                    topic_splits[self.sanitize_yaml(topic_name)] = split
             del contents
 
         with open(os.path.join(self.data_path, "data.json"), "r") as infile, open(
@@ -133,26 +176,27 @@ class WizardOfWikipedia(DataWrapper):
             contents = json.load(infile)
             csvfile.write("split,filename\n")
             for instance in contents:
-                if instance["chosen_topic"] not in topic_splits:
+                topic_name = self.sanitize_yaml(instance["chosen_topic"])
+                if topic_name not in topic_splits:
                     continue
                 topic_file = os.path.join(
                     self.data_path,
-                    f"{'-'.join(instance['chosen_topic'].split(' '))}.yaml",
+                    f"{'-'.join(topic_name.translate(topic_name.maketrans('.,', '- ')).split(' '))}.yml",
                 )
                 exists = os.path.exists(topic_file)
                 with open(topic_file, "a") as outfile:
                     if not exists:
                         self.filenames.append(
                             (
-                                topic_splits[instance["chosen_topic"]],
-                                os.path.basename(topic_file),
+                                topic_splits[topic_name],
+                                os.path.splitext(os.path.basename(topic_file))[0],
                             )
                         )
                         csvfile.write(
-                            f"{topic_splits[instance['chosen_topic']].value},{os.path.basename(topic_file)}\n"
+                            f"{topic_splits[topic_name].value},{os.path.splitext(os.path.basename(topic_file))[0]}\n"
                         )
                         outfile.write(
-                            f"categories:\n- {instance['chosen_topic']}\nconversations:\n"
+                            f'categories:\n- "{topic_name}"\nconversations:\n'
                         )
 
                     first_sentence = True

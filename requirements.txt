@@ -1,6 +1,8 @@
 ChatterBot
 chatterbot-corpus
 pre-commit==2.0.1
-spacy
+pyyaml==5.3
+spacy==2.1
+yake
 toml
 jsonpath_ng
