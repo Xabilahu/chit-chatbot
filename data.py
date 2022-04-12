@@ -1,11 +1,15 @@
 import csv
 import json
 import os
+import re
+import shutil
 import sys
 import tarfile
+import zipfile
 from abc import ABCMeta, abstractmethod
 from enum import Enum
 from typing import List, Tuple
+from xml.etree import ElementTree
 
 import urllib3
 import yake
@@ -43,16 +47,16 @@ class DataWrapper(metaclass=ABCMeta):
         return wordpunct_tokenize(self.sanitize_yaml(text))
 
     @abstractmethod
-    def prepare_data(self):
+    def prepare_data(self, **kwargs):
         raise NotImplementedError
 
-    def get_dataset_split(self, split: Split):
-        if not os.path.exists(self.data_path):
-            os.makedirs(self.data_path)
-            self.prepare_data()
+    def _call_data_preparation(self, data_path, **kwargs):
+        if not os.path.exists(data_path):
+            os.makedirs(data_path)
+            self.prepare_data(**kwargs)
         else:
             if len(self.filenames) == 0:
-                with open(os.path.join(self.data_path, "split_mapping.csv"), "r") as f:
+                with open(os.path.join(data_path, "split_mapping.csv"), "r") as f:
                     csvreader = csv.reader(f)
                     _ = next(csvreader)  # Skip header
                     for row in csvreader:
@@ -60,11 +64,14 @@ class DataWrapper(metaclass=ABCMeta):
                             (Split.train if row[0] == "train" else Split.test, row[1])
                         )
 
-            present_files = set(os.listdir(self.data_path))
+            present_files = set(os.listdir(data_path))
             for _, file in self.filenames:
-                if file.endswith("yaml") and file not in present_files:
-                    self.prepare_data()
+                if file.endswith("yml") and file not in present_files:
+                    self.prepare_data(**kwargs)
                     break
+
+    def get_dataset_split(self, split: Split, **kwargs):
+        self._call_data_preparation(self.data_path, **kwargs)
 
         return [
             ".".join(["chatterbot", "corpus", self.name, filename])
@@ -72,9 +79,9 @@ class DataWrapper(metaclass=ABCMeta):
             if s == split
         ]
 
-    def _download_data(self, filename: str, chunk_size: int = 8192):
+    def _download_data(self, filename: str, chunk_size: int = 8192, url: str = None):
         http = urllib3.PoolManager()
-        r = http.request("GET", self.url, preload_content=False)
+        r = http.request("GET", self.url if url is None else url, preload_content=False)
         with tqdm(
             total=int(r.headers["Content-Length"]),
             unit="iB",
@@ -102,7 +109,7 @@ class PersonaChat(DataWrapper):
             "en",
         )
 
-    def prepare_data(self):
+    def prepare_data(self, **kwargs):
         filename = os.path.join(self.data_path, "personachat_self_original.json")
         self._download_data(filename)
 
@@ -153,7 +160,7 @@ class WizardOfWikipedia(DataWrapper):
             "en",
         )
 
-    def prepare_data(self):
+    def prepare_data(self, **kwargs):
         filename = os.path.join(self.data_path, "wizard_of_wikipedia.tgz")
         self._download_data(filename)
 
@@ -282,15 +289,113 @@ class OpenSubtitles(DataWrapper):
             "zh_cn",
             "zh_tw",
         )
-        self.filename_template = "{}.yaml"
 
-    def prepare_data(self):
-        pass  # TODO
+    def __parse_xml(self, filename):
+        try:
+            root = ElementTree.parse(filename).getroot()
+            dialogue = []
+            for node in root.findall("s"):
+                for child in node.getiterator():
+                    if child.text is not None and child.text.strip() != "":
+                        dialogue.append(child.text.strip())
+                        break
+                    if child.tail is not None and child.tail.strip() != "":
+                        dialogue.append(child.tail.strip())
+                        break
 
-    def get_language(self, lang_id: str):
-        if lang_id not in self.languages:
+            categories = root.find("meta/source/genre")
+            return (
+                dialogue,
+                ["subtitles"] if categories is None else categories.text.split(","),
+            )
+        except ElementTree.ParseError:
+            return None, None
+
+    def prepare_data(self, **kwargs):
+        if "lang" not in kwargs:
             raise ValueError(
-                f"Unsupported language type {lang_id}. Accepted languages are: {' '.join(self.languages)}"
+                f"Please provide an ISO 639-1 language code, by passing the keyword argument 'lang'. Accepted languages are: {', '.join(self.languages)}"
             )
 
-        # TODO: download the file corresponding to the given lang_id and prepare it
+        formatted_url = self.url.format(kwargs["lang"])
+        file_basename = re.search(r"/(([^/]+)\.zip)$", formatted_url, re.M).group(1)
+        filename = os.path.join(self.data_path, file_basename)
+        self._download_data(filename, url=formatted_url)
+
+        with zipfile.ZipFile(filename, "r") as zip_file:
+            filenames = zip_file.namelist()
+            extracted_filenames = list(filter(lambda x: x.endswith("xml"), filenames))
+            zip_file.extractall(self.data_path)
+
+        train_size = int(len(extracted_filenames) * 0.85)
+        counter = 1
+        with open(
+            os.path.join(self.data_path, kwargs["lang"], "split_mapping.csv"), "w"
+        ) as csvfile:
+            csvfile.write("split,filename\n")
+            for xml_filename in extracted_filenames:
+                dialogue, categories = self.__parse_xml(
+                    os.path.join(self.data_path, xml_filename)
+                )
+                if dialogue is not None and categories is not None:
+                    if counter > train_size:
+                        yml_filename = os.path.join(
+                            self.data_path,
+                            kwargs["lang"],
+                            f"test-{counter - train_size}.yml",
+                        )
+                        self.filenames.append(
+                            (
+                                Split.test,
+                                os.path.splitext(os.path.basename(yml_filename))[0],
+                            )
+                        )
+                    else:
+                        yml_filename = os.path.join(
+                            self.data_path, kwargs["lang"], f"train-{counter}.yml"
+                        )
+                        self.filenames.append(
+                            (
+                                Split.train,
+                                os.path.splitext(os.path.basename(yml_filename))[0],
+                            )
+                        )
+
+                    csvfile.write(
+                        f"{self.filenames[-1][0].value},{self.filenames[-1][1]}\n"
+                    )
+                    with open(yml_filename, "w") as f:
+                        f.write("categories:\n")
+                        for category in categories:
+                            f.write(f'- "{self.sanitize_yaml(category)}"\n')
+                        f.write("conversations:\n")
+                        prev_sentence = " ".join(self.preprocess(dialogue[0]))
+                        for i in range(1, len(dialogue)):
+                            sentence = " ".join(self.preprocess(dialogue[i]))
+                            f.write(f'- - "{prev_sentence}"\n  - "{sentence}"\n')
+                            prev_sentence = sentence
+                counter += 1
+
+        os.remove(filename)
+        for filename in filenames:
+            file_path = os.path.join(self.data_path, filename)
+            if os.path.exists(file_path):
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+                else:
+                    shutil.rmtree(file_path, ignore_errors=True)
+
+    def get_dataset_split(self, split: Split, **kwargs):
+        if "lang" not in kwargs:
+            raise ValueError(
+                f"Please provide an ISO 639-1 language code, by passing the keyword argument 'lang'. Accepted languages are: {', '.join(self.languages)}"
+            )
+
+        base_path = os.path.join(self.data_path, kwargs["lang"])
+        self._call_data_preparation(base_path, **kwargs)
+
+        return [
+            ".".join(["chatterbot", "corpus", self.name, kwargs["lang"], filename])
+            for s, filename in self.filenames
+            if s == split
+        ]
