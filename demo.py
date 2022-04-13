@@ -36,12 +36,10 @@ elif "Wizard" in sys.argv[3]:
 
 
 idx = random.randint(0, len(filenames) - 10)
-# trainer.train(*filenames[idx : idx + 10])
-trainer.train(filenames)
+trainer.train(*filenames[idx : idx + 10])
 
 
 def writefile(input, output):
-    # os.makedirs(os.path.dirname("/results/"), exist_ok=True)
     with open(sys.argv[1] + ".txt", "a") as f:
         f.write(f'Input: "{input}"\n  Response: "{output}"\n')
         f.close()
