@@ -13,6 +13,7 @@ from xml.etree import ElementTree
 
 import urllib3
 import yake
+import yaml
 from nltk.tokenize import wordpunct_tokenize
 from tqdm import tqdm
 
@@ -38,7 +39,73 @@ class DataWrapper(metaclass=ABCMeta):
             self.name,
         )
 
-    def sanitize_yaml(self, text):
+    def _append_evaluation(self, infile: str, outfile: str, index: Tuple[int]):
+        infp = open(infile, "r")
+        contents = yaml.safe_load(infp)
+        with open(outfile, "a") as f:
+            for conversation in contents["conversations"]:
+                for utterance in conversation[index[0] : index[1]]:
+                    sentence = (
+                        utterance[1:-1]
+                        if utterance.startswith('"') and utterance.endswith('"')
+                        else utterance
+                    )
+                    f.write(f"{sentence}\n")
+        infp.close()
+
+    def evaluation_files(self, percentage: float = 1.0, **kwargs):
+        if self.filenames == []:
+            self.get_dataset_split(Split.train, **kwargs)
+
+        base_path = (
+            os.path.join(self.data_path, kwargs["lang"])
+            if "lang" in kwargs
+            else self.data_path
+        )
+        generate_evaluation_files = False
+        evaluation_filenames = []
+        for filename in ["train-{}.inputs", "test-{}.inputs", "test-{}.targets"]:
+            evaluation_filenames.append(
+                os.path.join(base_path, filename.format(percentage))
+            )
+            if not os.path.exists(evaluation_filenames[-1]):
+                generate_evaluation_files = True
+
+        if generate_evaluation_files:
+            train_target = int(
+                len(list(filter(lambda x: x[0] == Split.train, self.filenames)))
+                * percentage
+            )
+            test_target = int(
+                len(list(filter(lambda x: x[0] == Split.test, self.filenames)))
+                * percentage
+            )
+            train_count, test_count = 0, 0
+            for split, filename in self.filenames:
+                full_filename = os.path.join(base_path, f"{filename}.yml")
+                if split == Split.train and train_count < train_target:
+                    self._append_evaluation(
+                        full_filename,
+                        os.path.join(base_path, f"train-{percentage}.inputs"),
+                        (0, -1),
+                    )
+                    train_count += 1
+                elif split == Split.test and test_count < test_target:
+                    self._append_evaluation(
+                        full_filename,
+                        os.path.join(base_path, f"test-{percentage}.inputs"),
+                        (0, -1),
+                    )
+                    self._append_evaluation(
+                        full_filename,
+                        os.path.join(base_path, f"test-{percentage}.targets"),
+                        (1, None),
+                    )
+                    test_count += 1
+
+        return evaluation_filenames
+
+    def sanitize_yaml(self, text: str):
         # Unify quote characters into ' so that we can later quote the whole text with "
         # (avoid conflicts with YAML indicator symbols : and -)
         return text.translate(text.maketrans('"/\\', "'  "))
@@ -66,7 +133,10 @@ class DataWrapper(metaclass=ABCMeta):
 
             present_files = set(os.listdir(data_path))
             for _, file in self.filenames:
-                if file.endswith("yml") and file not in present_files:
+                if (
+                    file.endswith("yml")
+                    and os.path.splitext(file)[0] not in present_files
+                ):
                     self.prepare_data(**kwargs)
                     break
 
@@ -310,6 +380,14 @@ class OpenSubtitles(DataWrapper):
             )
         except ElementTree.ParseError:
             return None, None
+
+    def evaluation_files(self, **kwargs):
+        if "lang" not in kwargs:
+            raise ValueError(
+                f"Please provide an ISO 639-1 language code, by passing the keyword argument 'lang'. Accepted languages are: {', '.join(self.languages)}"
+            )
+
+        return super(OpenSubtitles, self).evaluation_files(**kwargs)
 
     def prepare_data(self, **kwargs):
         if "lang" not in kwargs:
