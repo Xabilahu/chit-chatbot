@@ -1,34 +1,37 @@
 import csv
+import gzip
 import json
 import os
+import random
 import re
 import shutil
 import sys
 import tarfile
 import zipfile
 from abc import ABCMeta, abstractmethod
-from enum import Enum
-from typing import List, Tuple
+from itertools import chain
+from typing import Dict, List, Tuple
 from xml.etree import ElementTree
 
 import urllib3
 import yake
 import yaml
-from nltk.tokenize import wordpunct_tokenize
 from tqdm import tqdm
 
+from utils import Split, preprocess, sanitize_yaml
 
-class Split(Enum):
-    train = "train"
-    test = "test"
+FASTTEXT_DOWNLOAD_URL = (
+    "https://dl.fbaipublicfiles.com/fasttext/vectors-crawl/cc.{}.300.vec.gz"
+)
 
 
 class DataWrapper(metaclass=ABCMeta):
-    def __init__(self, name: str, url: str, *langs: str):
+    def __init__(self, name: str, url: str, *langs: str) -> None:
         self.name = name
         self.url = url
         self.languages = set(langs)
         self.filenames: List[Tuple[Split, str]] = []
+        self.dataset_percentage = 1.0
         self.data_path = os.path.join(
             sys.exec_prefix,
             "lib",
@@ -39,7 +42,7 @@ class DataWrapper(metaclass=ABCMeta):
             self.name,
         )
 
-    def _append_evaluation(self, infile: str, outfile: str, index: Tuple[int]):
+    def _append_evaluation(self, infile: str, outfile: str, index: Tuple[int]) -> None:
         infp = open(infile, "r")
         contents = yaml.safe_load(infp)
         with open(outfile, "a") as f:
@@ -53,71 +56,130 @@ class DataWrapper(metaclass=ABCMeta):
                     f.write(f"{sentence}\n")
         infp.close()
 
-    def evaluation_files(self, percentage: float = 1.0, **kwargs):
+    def evaluation_files(self, **kwargs) -> Dict[str, str]:
         if self.filenames == []:
             self.get_dataset_split(Split.train, **kwargs)
+
+        lang = "en" if "lang" not in kwargs else kwargs["lang"]
+        embedding_filename = os.path.join(
+            os.path.dirname(self.data_path), f"cc.{lang}.vec"
+        )
+        if not os.path.exists(embedding_filename):
+            self._download_data(
+                f"{embedding_filename}.gz", url=FASTTEXT_DOWNLOAD_URL.format(lang)
+            )
+            with open(embedding_filename, "wb") as outfp, gzip.open(
+                f"{embedding_filename}.gz"
+            ) as infp:
+                while True:
+                    chunk = infp.read(8192)
+                    if not chunk:
+                        break
+                    outfp.write(chunk)
+            os.remove(f"{embedding_filename}.gz")
 
         base_path = (
             os.path.join(self.data_path, kwargs["lang"])
             if "lang" in kwargs
             else self.data_path
         )
-        generate_evaluation_files = False
-        evaluation_filenames = []
-        for filename in ["train-{}.inputs", "test-{}.inputs", "test-{}.targets"]:
-            evaluation_filenames.append(
-                os.path.join(base_path, filename.format(percentage))
+        evaluation_filenames = dict()
+        for key, filename in [
+            ("train_source", "train-source-{}.txt"),
+            ("text_vocab", "vocab-{}.txt"),
+            ("vector_vocab", "vocab-{}.npy"),
+            ("test_source", "test-source-{}.txt"),
+            ("test_target", "test-target-{}.txt"),
+        ]:
+            evaluation_filenames[key] = os.path.join(
+                base_path, filename.format(self.dataset_percentage)
             )
-            if not os.path.exists(evaluation_filenames[-1]):
-                generate_evaluation_files = True
 
-        if generate_evaluation_files:
-            train_target = int(
-                len(list(filter(lambda x: x[0] == Split.train, self.filenames)))
-                * percentage
-            )
-            test_target = int(
-                len(list(filter(lambda x: x[0] == Split.test, self.filenames)))
-                * percentage
-            )
-            train_count, test_count = 0, 0
-            for split, filename in self.filenames:
-                full_filename = os.path.join(base_path, f"{filename}.yml")
-                if split == Split.train and train_count < train_target:
-                    self._append_evaluation(
-                        full_filename,
-                        os.path.join(base_path, f"train-{percentage}.inputs"),
-                        (0, -1),
-                    )
-                    train_count += 1
-                elif split == Split.test and test_count < test_target:
-                    self._append_evaluation(
-                        full_filename,
-                        os.path.join(base_path, f"test-{percentage}.inputs"),
-                        (0, -1),
-                    )
-                    self._append_evaluation(
-                        full_filename,
-                        os.path.join(base_path, f"test-{percentage}.targets"),
-                        (1, None),
-                    )
-                    test_count += 1
+        for split, filename in self.filenames:
+            full_filename = os.path.join(base_path, f"{filename}.yml")
+            if split == Split.train:
+                self._append_evaluation(
+                    full_filename,
+                    os.path.join(base_path, evaluation_filenames["train_source"]),
+                    (0, -1),
+                )
+            elif split == Split.test:
+                self._append_evaluation(
+                    full_filename,
+                    os.path.join(base_path, evaluation_filenames["test_source"]),
+                    (0, -1),
+                )
+                self._append_evaluation(
+                    full_filename,
+                    os.path.join(base_path, evaluation_filenames["test_target"]),
+                    (1, None),
+                )
+
+        # Now we generate the vocab file
+        vocab = set()
+        with open(evaluation_filenames["text_vocab"], "w") as outfp, open(
+            evaluation_filenames["train_source"], "r"
+        ) as infp:
+            while True:
+                line = infp.readline()
+                if not line:
+                    break
+                words = line.strip().split(" ")
+                vocab.update(words)
+                outfp.write("\n".join(words))
+                outfp.write("\n")
+
+        with open(embedding_filename, "r") as infp, open(
+            evaluation_filenames["vector_vocab"], "w"
+        ) as outfp:
+            while True:
+                line = infp.readline()
+                if not line:
+                    break
+                tokens = line.strip().split()
+                if tokens[0] not in vocab:
+                    continue
+                if len(tokens) == 301:
+                    outfp.write(line)
+                elif tokens[1] == "»":
+                    outfp.write(f"{tokens[0]} {' '.join(tokens[2:])}\n")
 
         return evaluation_filenames
 
-    def sanitize_yaml(self, text: str):
-        # Unify quote characters into ' so that we can later quote the whole text with "
-        # (avoid conflicts with YAML indicator symbols : and -)
-        return text.translate(text.maketrans('"/\\', "'  "))
+    def downsize(self, percentage: float, **kwargs) -> None:
+        if percentage > 1.0 or percentage <= 0.0:
+            raise ValueError("Downsize percentage must be in the range (0,1].")
 
-    def preprocess(self, text: str):
-        return wordpunct_tokenize(self.sanitize_yaml(text))
+        if self.filenames == []:
+            self._call_data_preparation(self.data_path, **kwargs)
+
+        self.dataset_percentage *= percentage
+        train_size = int(
+            len(list(filter(lambda x: x[0] == Split.train, self.filenames)))
+            * percentage
+        )
+        test_size = int(
+            len(list(filter(lambda x: x[0] == Split.test, self.filenames))) * percentage
+        )
+
+        random.shuffle(self.filenames)
+        train_count, test_count = 0, 0
+        new_filenames = []
+        for split, filename in self.filenames:
+            if split == Split.train and train_count < train_size:
+                new_filenames.append((split, filename))
+                train_count += 1
+            elif split == Split.test and test_count < test_size:
+                new_filenames.append((split, filename))
+                test_count += 1
+
+        self.filenames = new_filenames
 
     @abstractmethod
-    def prepare_data(self, **kwargs):
+    def prepare_data(self, **kwargs) -> None:
         raise NotImplementedError
 
-    def _call_data_preparation(self, data_path, **kwargs):
+    def _call_data_preparation(self, data_path: str, **kwargs) -> None:
         if not os.path.exists(data_path):
             os.makedirs(data_path)
             self.prepare_data(**kwargs)
@@ -133,14 +195,11 @@ class DataWrapper(metaclass=ABCMeta):
 
             present_files = set(os.listdir(data_path))
             for _, file in self.filenames:
-                if (
-                    file.endswith("yml")
-                    and os.path.splitext(file)[0] not in present_files
-                ):
+                if f"{file}.yml" not in present_files:
                     self.prepare_data(**kwargs)
                     break
 
-    def get_dataset_split(self, split: Split, **kwargs):
+    def get_dataset_split(self, split: Split, **kwargs) -> List[str]:
         self._call_data_preparation(self.data_path, **kwargs)
 
         return [
@@ -149,7 +208,9 @@ class DataWrapper(metaclass=ABCMeta):
             if s == split
         ]
 
-    def _download_data(self, filename: str, chunk_size: int = 8192, url: str = None):
+    def _download_data(
+        self, filename: str, chunk_size: int = 8192, url: str = None
+    ) -> None:
         http = urllib3.PoolManager()
         r = http.request("GET", self.url if url is None else url, preload_content=False)
         with tqdm(
@@ -167,19 +228,19 @@ class DataWrapper(metaclass=ABCMeta):
                     pbar.update(len(data))
         r.release_conn()
 
-    def available_languages(self):
+    def available_languages(self) -> List[str]:
         return self.languages
 
 
 class PersonaChat(DataWrapper):
-    def __init__(self):
+    def __init__(self) -> None:
         super(PersonaChat, self).__init__(
             "Persona-Chat",
             "https://s3.amazonaws.com/datasets.huggingface.co/personachat/personachat_self_original.json",
             "en",
         )
 
-    def prepare_data(self, **kwargs):
+    def prepare_data(self, **kwargs) -> None:
         filename = os.path.join(self.data_path, "personachat_self_original.json")
         self._download_data(filename)
 
@@ -189,48 +250,55 @@ class PersonaChat(DataWrapper):
 
         with open(os.path.join(self.data_path, "split_mapping.csv"), "w") as csvfile:
             csvfile.write("split,filename\n")
-            for split, key_name in [(Split.train, "train"), (Split.test, "valid")]:
-                for idx, dialog in enumerate(contents["train"], start=1):
-                    c_filename = os.path.join(
-                        self.data_path, f"{split.value}-{idx}.yml"
-                    )
-                    self.filenames.append(
-                        (split, os.path.splitext(os.path.basename(c_filename))[0])
-                    )
-                    csvfile.write(
-                        f"{split.value},{os.path.splitext(os.path.basename(c_filename))[0]}\n"
-                    )
-                    with open(c_filename, "w") as outfile:
-                        keywords = set()
-                        for p in dialog["personality"]:
-                            keyword_candidates = keyword_extractor.extract_keywords(p)
-                            if len(keyword_candidates) > 0:
-                                keywords.add(keyword_candidates[0][0])
-                        outfile.write("categories:\n")
-                        for kw in keywords:
-                            outfile.write(f"- {kw}\n")
-                        outfile.write("conversations:\n")
-                        first = True
-                        for utterance in dialog["utterances"][-1]["history"]:
-                            sentence = " ".join(self.preprocess(utterance))
-                            if first:
-                                outfile.write(f'- - "{sentence}"\n')
-                                first = False
-                            else:
-                                outfile.write(f'  - "{sentence}"\n')
+            train_target, counter = (
+                int((len(contents["train"]) + len(contents["valid"])) * 0.8),
+                1,
+            )
+            for dialog in chain(contents["train"], contents["valid"]):
+                idx, split = counter, Split.train
+                if counter > train_target:
+                    idx -= train_target
+                    split = Split.test
+
+                c_filename = os.path.join(self.data_path, f"{split.value}-{idx}.yml")
+                self.filenames.append(
+                    (split, os.path.splitext(os.path.basename(c_filename))[0])
+                )
+                csvfile.write(
+                    f"{split.value},{os.path.splitext(os.path.basename(c_filename))[0]}\n"
+                )
+                with open(c_filename, "w") as outfile:
+                    keywords = set()
+                    for p in dialog["personality"]:
+                        keyword_candidates = keyword_extractor.extract_keywords(p)
+                        if len(keyword_candidates) > 0:
+                            keywords.add(keyword_candidates[0][0])
+                    outfile.write("categories:\n")
+                    for kw in keywords:
+                        outfile.write(f"- {kw}\n")
+                    outfile.write("conversations:\n")
+                    first = True
+                    for utterance in dialog["utterances"][-1]["history"]:
+                        sentence = " ".join(preprocess(utterance))
+                        if first:
+                            outfile.write(f'- - "{sentence}"\n')
+                            first = False
+                        else:
+                            outfile.write(f'  - "{sentence}"\n')
+                counter += 1
         del contents
         os.remove(filename)
 
 
 class WizardOfWikipedia(DataWrapper):
-    def __init__(self):
+    def __init__(self) -> None:
         super(WizardOfWikipedia, self).__init__(
             "Wizard-Of-Wikipedia",
             "http://parl.ai/downloads/wizard_of_wikipedia/wizard_of_wikipedia.tgz",
             "en",
         )
 
-    def prepare_data(self, **kwargs):
+    def prepare_data(self, **kwargs) -> None:
         filename = os.path.join(self.data_path, "wizard_of_wikipedia.tgz")
         self._download_data(filename)
 
@@ -244,7 +312,7 @@ class WizardOfWikipedia(DataWrapper):
             contents = json.load(f)
             for split in Split:
                 for topic_name in contents[split.value]:
-                    topic_splits[self.sanitize_yaml(topic_name)] = split
+                    topic_splits[sanitize_yaml(topic_name)] = split
             del contents
 
         with open(os.path.join(self.data_path, "data.json"), "r") as infile, open(
@@ -253,7 +321,7 @@ class WizardOfWikipedia(DataWrapper):
             contents = json.load(infile)
             csvfile.write("split,filename\n")
             for instance in contents:
-                topic_name = self.sanitize_yaml(instance["chosen_topic"])
+                topic_name = sanitize_yaml(instance["chosen_topic"])
                 if topic_name not in topic_splits:
                     continue
                 topic_file = os.path.join(
@@ -278,7 +346,7 @@ class WizardOfWikipedia(DataWrapper):
 
                     first_sentence = True
                     for utterance in instance["dialog"]:
-                        sentence = " ".join(self.preprocess(utterance["text"]))
+                        sentence = " ".join(preprocess(utterance["text"]))
                         if first_sentence:
                             outfile.write(f'- - "{sentence}"\n')
                             first_sentence = False
@@ -292,7 +360,7 @@ class WizardOfWikipedia(DataWrapper):
 
 
 class OpenSubtitles(DataWrapper):
-    def __init__(self):
+    def __init__(self) -> None:
         super(OpenSubtitles, self).__init__(
             "Open-Subtitles",
             "https://opus.nlpl.eu/download.php?f=OpenSubtitles/v2018/raw/{}.zip",
@@ -360,7 +428,7 @@ class OpenSubtitles(DataWrapper):
             "zh_tw",
         )
 
-    def __parse_xml(self, filename):
+    def __parse_xml(self, filename: str) -> Tuple[List[str], List[str]]:
         try:
             root = ElementTree.parse(filename).getroot()
             dialogue = []
@@ -381,7 +449,7 @@ class OpenSubtitles(DataWrapper):
         except ElementTree.ParseError:
             return None, None
 
-    def evaluation_files(self, **kwargs):
+    def evaluation_files(self, **kwargs) -> List[str]:
         if "lang" not in kwargs:
             raise ValueError(
                 f"Please provide an ISO 639-1 language code, by passing the keyword argument 'lang'. Accepted languages are: {', '.join(self.languages)}"
@@ -389,7 +457,7 @@ class OpenSubtitles(DataWrapper):
 
         return super(OpenSubtitles, self).evaluation_files(**kwargs)
 
-    def prepare_data(self, **kwargs):
+    def prepare_data(self, **kwargs) -> None:
         if "lang" not in kwargs:
             raise ValueError(
                 f"Please provide an ISO 639-1 language code, by passing the keyword argument 'lang'. Accepted languages are: {', '.join(self.languages)}"
@@ -445,11 +513,11 @@ class OpenSubtitles(DataWrapper):
                     with open(yml_filename, "w") as f:
                         f.write("categories:\n")
                         for category in categories:
-                            f.write(f'- "{self.sanitize_yaml(category)}"\n')
+                            f.write(f'- "{sanitize_yaml(category)}"\n')
                         f.write("conversations:\n")
-                        prev_sentence = " ".join(self.preprocess(dialogue[0]))
+                        prev_sentence = " ".join(preprocess(dialogue[0]))
                         for i in range(1, len(dialogue)):
-                            sentence = " ".join(self.preprocess(dialogue[i]))
+                            sentence = " ".join(preprocess(dialogue[i]))
                             f.write(f'- - "{prev_sentence}"\n  - "{sentence}"\n')
                             prev_sentence = sentence
                 counter += 1
@@ -463,7 +531,7 @@ class OpenSubtitles(DataWrapper):
                 else:
                     shutil.rmtree(file_path, ignore_errors=True)
 
-    def get_dataset_split(self, split: Split, **kwargs):
+    def get_dataset_split(self, split: Split, **kwargs) -> List[str]:
         if "lang" not in kwargs:
             raise ValueError(
                 f"Please provide an ISO 639-1 language code, by passing the keyword argument 'lang'. Accepted languages are: {', '.join(self.languages)}"
