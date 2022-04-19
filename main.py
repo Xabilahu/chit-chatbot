@@ -122,7 +122,7 @@ def build_dataset(args: argparse.Namespace) -> DataWrapper:
     elif args.wizard_of_wikipedia:
         dataset = WizardOfWikipedia()
     elif args.open_subtitles:
-        dataset = OpenSubtitles(lang=args.language)
+        dataset = OpenSubtitles()
     else:
         raise ValueError("Please, specify a dataset to train the ChatBot.")
 
@@ -192,25 +192,26 @@ def run_against_test(bot: ChatBot, dataset: DataWrapper) -> None:
     with open(f"test-responses-{dataset.dataset_percentage}.txt", "w") as outfp:
         for filename in test_filenames:
             full_filename = convert_chatterbot_filename(filename)
+            basename = os.path.basename(full_filename)
             infp = open(full_filename, "r")
             contents = yaml.safe_load(infp)
+            counter, target = 0, sum([len(x[:-1]) for x in contents["conversations"]])
             for idx, conversation in enumerate(contents["conversations"]):
                 for utterance in conversation[:-1]:
+                    percent = float(counter + 1) / target
+                    hashes = "#" * int(round(percent * 20))
+                    spaces = " " * (20 - len(hashes))
+                    logger.info(
+                        f"Testing {basename}: [{hashes + spaces}] {int(round(percent * 100))}%\r"
+                    )
                     response_stmt = bot.get_response(
                         utterance, conversation=f"test:conv-{idx}"
                     )
                     outfp.write(f"{response_stmt.text}\n")
+                    counter += 1
 
-                percent = float(idx + 1) / len(contents["conversations"])
-                hashes = "#" * int(round(percent * 20))
-                spaces = " " * (20 - len(hashes))
-                logger.info(
-                    f"Testing {os.path.basename(full_filename)}: [{hashes + spaces}] {int(round(percent * 100))}%\r"
-                )
-            logger.info(
-                f"Testing {os.path.basename(full_filename)}: [{'#' * 20}] 100%\n"
-            )
             infp.close()
+            logger.info("\n", extra={"simple": True})
 
 
 def run_evaluation(bot: ChatBot, dataset: DataWrapper, **kwargs) -> None:
@@ -240,19 +241,19 @@ def run_evaluation(bot: ChatBot, dataset: DataWrapper, **kwargs) -> None:
 if __name__ == "__main__":
     args = parse_args()
     logger = setup_logger()
-
     logger.info("Building the dataset...\n")
-    dataset = build_dataset(args)
-    logger.info(
-        f"The dataset contains {len(dataset.get_dataset_split(Split.train))} training files and {len(dataset.get_dataset_split(Split.test))} test files.\n"
-    )
 
     kwargs = {}
     if args.open_subtitles:
         kwargs["lang"] = args.language
 
+    dataset = build_dataset(args)
+    logger.info(
+        f"The dataset contains {len(dataset.get_dataset_split(Split.train, **kwargs))} training files and {len(dataset.get_dataset_split(Split.test, **kwargs))} test files.\n"
+    )
+
     dataset.downsize(args.dataset_fraction, **kwargs)
-    training_filenames = dataset.get_dataset_split(Split.train)
+    training_filenames = dataset.get_dataset_split(Split.train, **kwargs)
     logger.info(
         f"Training the ChatBot with {dataset.dataset_percentage * 100:.2f}% of the data ({len(training_filenames)} files)...\n"
     )

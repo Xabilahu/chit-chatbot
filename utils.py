@@ -18,12 +18,18 @@ class Split(Enum):
 class LoggerWriter:
     def __init__(self, logfunc: Callable) -> None:
         self.logfunc = logfunc
+        self.prev = None
 
     def write(self, msg: str) -> None:
-        self.logfunc(f"{msg[1:]}\r")
+        if msg.endswith("100%") and msg != self.prev:
+            self.prev = msg
+            self.logfunc(f"{msg[1:]}\n")
+        elif msg != self.prev:
+            self.logfunc(f"{msg[1:]}\r")
 
     def flush(self) -> None:
-        self.logfunc("\n", extra={"simple": True})
+        pass
+        # self.logfunc("\n", extra={"simple": True})
 
 
 # Taken from: https://stackoverflow.com/questions/34954373/disable-format-for-some-messages
